@@ -106,7 +106,7 @@ void printTrie(unsigned int offset, int depth, char *word){
 
     if(current.location != NAN){
         word[depth] = '\0';
-        printf("%s\n", word);
+        printf("%s = %u\n", word, current.location);
     }
 
     for(int i = 0; i < 26; i++){
