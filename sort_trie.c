@@ -5,7 +5,7 @@
 #define RAM 10485760 // 10MB
 
 typedef struct FileWord {
-	short frequency;
+	unsigned short frequency;
 	unsigned char len;
 } FileWord;
 
@@ -140,7 +140,7 @@ int create_initial_runs_variable(const char *input_file, const char *prefix, int
 
 			for (int i = 0; i < read_count; i++) {
 				FileWord fw = { buffer[i].frequency, buffer[i].len };
-				fwrite(&fw, sizeof(FileWord), 1, out);
+				fwrite(&buffer[i].len, sizeof(unsigned char), 1, out);
 				fwrite(buffer[i].name, sizeof(unsigned char), buffer[i].len, out);
 
 				free(buffer[i].name);
@@ -214,7 +214,7 @@ void merge_k_runs_variable(const char *prefix, int current_pass, int start_run_i
 		HeapNode root = heap[0];
 
 		FileWord fw = { root.word.frequency, root.word.len };
-		fwrite(&fw, sizeof(FileWord), 1, out);
+		fwrite(&root.word.len, sizeof(unsigned char), 1, out);
 		fwrite(root.word.name, sizeof(unsigned char), root.word.len, out);
 
 		size_t freed_ram = root.word.len + 1 + sizeof(Word);
@@ -307,17 +307,16 @@ int main(int argc, char** argv) {
 	const char *temp_prefix = "temp_var_run";
 
 	external_merge_sort(input_file, output_file, temp_prefix);
-	printf("\nExternal Sorting completed safely!\n\n");
 
 	FILE *verify = fopen(output_file, "rb");
 	if (verify) {
 		printf("Verified Decreasing Sorted Structure Data Output:\n");
-		FileWord fw;
-		while (fread(&fw, sizeof(FileWord), 1, verify) == 1) {
-			char *name = (char*)malloc(fw.len + 1);
-			if (fread(name, sizeof(unsigned char), fw.len, verify) == (size_t)fw.len) {
-				name[fw.len] = '\0';
-				printf("Frequency: %2d | Name Length: %2d | Name String: %s\n", fw.frequency, fw.len, name);
+		unsigned char len;
+		while (fread(&len, sizeof(unsigned char), 1, verify) == 1) {
+			char *name = (char*)malloc(len + 1);
+			if (fread(name, sizeof(unsigned char), len, verify) == (size_t)len) {
+				name[len] = '\0';
+				printf("Name Length: %2d | Name String: %s\n",len, name);
 			}
 			free(name);
 		}
