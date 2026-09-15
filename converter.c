@@ -12,7 +12,6 @@
 #define NAN UINT_MAX
 
 typedef struct Node Node;
-
 struct Node {
     unsigned int arr[26];
     unsigned int location;
@@ -20,18 +19,6 @@ struct Node {
 
 Node *node;
 FILE *fileTrie, *wordFile, *csvFile;
-
-typedef struct FileWord {
-    short frequency;
-    unsigned char len;
-} FileWord;
-
-typedef struct Word Word;
-struct Word {
-    short frequency;
-    unsigned char len;
-    char* name;
-};
 
 typedef struct Matrix Matrix;
 struct Matrix {
@@ -45,26 +32,8 @@ struct Cell {
 };
 
 char *buf;
-int n, m = 0;
+int n = 0;
 Matrix *matrix;
-
-void printFile(FILE *f) {
-    Word *w = (Word *) malloc(sizeof(Word));
-    if (!w) return;
-    int read_count;
-    unsigned char* ch;
-    fseek(f, 0, SEEK_SET);
-
-    while ((read_count = fread(w, sizeof(Word), 1, f)) > 0) {
-        ch = (unsigned char*) malloc((w->len + 1) * sizeof(unsigned char));
-        if (!ch) break;
-        fread(ch, sizeof(unsigned char), w->len, f);
-        ch[w->len] = '\0';
-        printf("%s | %d\n", ch, w->frequency);
-        free(ch);
-    }
-    free(w);
-}
 
 void getBuffer() {
     n = fread(buf, sizeof(char), BUFF - 1, wordFile);
@@ -78,45 +47,18 @@ void getBuffer() {
 
     if (n == BUFF - 1 && !ENDOFLINE(buf[n - 1])) {
         int rewind_count = 0;
-        while (n > 0 && !ENDOFLINE(buf[n - 1])) {
+        // Rewind only back to the last non-alphabetical or delimiter boundary
+        while (n > 0 && ISALPHABET(buf[n - 1])) {
             n--;
             rewind_count++;
         }
-        if (rewind_count > 0) {
+        if (rewind_count > 0 && n > 0) {
             fseek(wordFile, -rewind_count, SEEK_CUR);
             buf[n] = '\0';
         }
     }
 }
 
-void getMatrix() {
-    fseek(wordFile, 0, SEEK_SET);
-    int read_bytes, i, row = 0, oneLine = 1, col = 1;
-    matrix = (Matrix *) malloc(sizeof(Matrix));
-    while ((read_bytes = fread(buf, sizeof(char), BUFF - 1, wordFile)) > 0) {
-        i = 0;
-        while (i < read_bytes) {
-            if (ISCOLUMN(buf[i]) && oneLine) {
-                col += 1;
-            }
-
-            if (ENDOFLINE(buf[i])) {
-                if (buf[i] == '\n') {
-                    oneLine = 0;
-                    row += 1;
-                }
-            }
-            i++;
-        }
-    }
-    matrix->row = row;
-    matrix->col = col;
-
-    fwrite(matrix, sizeof(Matrix), 1, csvFile);
-    fseek(wordFile, 0, SEEK_SET);
-}
-
-// Helper to safely get the current char or refill buffer if needed
 char getChar(int *index) {
     if (*index >= n) {
         getBuffer();
@@ -124,6 +66,33 @@ char getChar(int *index) {
         if (n == 0) return '\0';
     }
     return buf[*index];
+}
+
+void getMatrix() {
+    fseek(wordFile, 0, SEEK_SET);
+    int read_bytes, i, row = 0, oneLine = 1, col = 1;
+    while ((read_bytes = fread(buf, sizeof(char), BUFF - 1, wordFile)) > 0) {
+        i = 0;
+        while (i < read_bytes) {
+            if (ISCOLUMN(buf[i]) && oneLine) {
+                col += 1;
+            }
+            if (buf[i] == '\n') {
+                oneLine = 0;
+                row += 1;
+            }
+            i++;
+        }
+    }
+    matrix = (Matrix *) malloc(sizeof(Matrix));
+    matrix->row = row;
+    matrix->col = col;
+
+    fwrite(matrix, sizeof(Matrix), 1, csvFile);
+
+    // Reset file and buffer state for subsequent operations
+    fseek(wordFile, 0, SEEK_SET);
+    n = 0;
 }
 
 int getWordCount(int index) {
@@ -160,11 +129,13 @@ void fillCell(Cell *cell, int *j) {
             (*j)++;
         }
 
-        getNode(0);
+        getNode(0); // Reset to root node
         while ((c = getChar(j)) != '\0' && ISALPHABET(c)) {
             index = c - 'a';
-            if (node->arr[index]) {
+            if (node->arr[index] != NAN && node->arr[index] != 0) {
                 getNode(node->arr[index]);
+            } else {
+                break;
             }
             (*j)++;
         }
@@ -175,10 +146,15 @@ void fillCell(Cell *cell, int *j) {
         }
     }
 
-    // Consume trailing delimiters (commas, carriage returns, newlines)
-    while ((c = getChar(j)) != '\0' && (ISCOLUMN(c) || ENDOFLINE(c))) {
+    // Safely advance past delimiters (comma or line breaks)
+    c = getChar(j);
+    if (c == ',') {
         (*j)++;
-        if (c == '\n' || ISCOLUMN(c)) break;
+    } else if (c == '\r') {
+        (*j)++;
+        if (getChar(j) == '\n') (*j)++;
+    } else if (c == '\n') {
+        (*j)++;
     }
 }
 
@@ -191,13 +167,24 @@ void writeCell(Cell *cell) {
 
 void createCell() {
     int index = 0;
+    getBuffer(); // Initial buffer population
     for (int i = 0; i < matrix->row; i++) {
         Cell cell[matrix->col];
         for (int j = 0; j < matrix->col; j++) {
+            // Save state position before word counting
+            long saved_pos = ftell(wordFile) - (n - index);
+
             int word_count = getWordCount(index);
             cell[j].len = word_count;
             cell[j].arr = malloc(word_count * sizeof(unsigned int));
             if (!cell[j].arr) return;
+
+            // Reset file and buffer back to start of field for filling
+            fseek(wordFile, saved_pos, SEEK_SET);
+            n = 0;
+            index = 0;
+            getBuffer();
+
             fillCell(&cell[j], &index);
         }
         writeCell(cell);
@@ -208,19 +195,14 @@ void createCell() {
 }
 
 void printMiniCsv() {
-    FILE *f;
+    FILE *f = fopen("miniCsv", "rb");
     Matrix m_out;
     Cell cell;
     unsigned int *arr;
 
-    f = fopen("miniCsv", "rb");
-    if (!f) {
-        perror("miniCsv");
-        return;
-    }
+    if (!f) return;
 
     if (fread(&m_out, sizeof(Matrix), 1, f) != 1) {
-        printf("Could not read Matrix\n");
         fclose(f);
         return;
     }
@@ -231,20 +213,17 @@ void printMiniCsv() {
         printf("Row %d:\n", i);
         for (int j = 0; j < m_out.col; j++) {
             if (fread(&cell.len, sizeof(unsigned char), 1, f) != 1) {
-                printf("Error reading cell length\n");
                 fclose(f);
                 return;
             }
 
             arr = malloc(cell.len * sizeof(unsigned int));
             if (!arr) {
-                perror("malloc");
                 fclose(f);
                 return;
             }
 
             if (fread(arr, sizeof(unsigned int), cell.len, f) != cell.len) {
-                printf("Error reading cell data\n");
                 free(arr);
                 fclose(f);
                 return;
@@ -258,7 +237,6 @@ void printMiniCsv() {
             free(arr);
         }
     }
-
     fclose(f);
 }
 
@@ -275,12 +253,12 @@ int main(int argc, char** argv) {
     node = (Node *) malloc(sizeof(Node));
     if (!buf || !node) return 1;
 
-    getBuffer();
     getMatrix();
     createCell();
 
     free(buf);
     free(node);
+    free(matrix);
 
     fclose(csvFile);
     fclose(wordFile);
