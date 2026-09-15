@@ -18,7 +18,6 @@ unsigned int offset;
 typedef struct Word Word;
 
 struct Word{
-	short frequency;
 	unsigned char len;
 };
 
