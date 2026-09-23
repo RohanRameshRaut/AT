@@ -2,9 +2,18 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <unistd.h>
+#include <sys/wait.h>
 #include <ncurses.h>
 
-#define MAX_CELL_STR_LEN 1024
+// Bitmask Helper Macros
+#define IS_ROW_HIDDEN(r) ((hidden_rows[(r) / 8] >> ((r) % 8)) & 1)
+#define HIDE_ROW(r)      (hidden_rows[(r) / 8] |= (1 << ((r) % 8)))
+#define UNHIDE_ROW(r)    (hidden_rows[(r) / 8] &= ~(1 << ((r) % 8)))
+
+#define IS_COL_HIDDEN(c) ((hidden_cols[(c) / 8] >> ((c) % 8)) & 1)
+#define HIDE_COL(c)      (hidden_cols[(c) / 8] |= (1 << ((c) % 8)))
+#define UNHIDE_COL(c)    (hidden_cols[(c) / 8] &= ~(1 << ((c) % 8)))
 
 // 24-byte Matrix Header
 typedef struct Matrix {
@@ -22,14 +31,20 @@ Matrix matrix;
 int *row_map = NULL;
 int *col_map = NULL;
 
-// Active Buffer Window in RAM (Screen Size + Margins)
+// 1-bit per element Visibility Bitmask Arrays (0 = visible, 1 = hidden)
+unsigned char *hidden_rows = NULL;
+unsigned char *hidden_cols = NULL;
+size_t hidden_rows_bytes = 0;
+size_t hidden_cols_bytes = 0;
+
+// Active Buffer Window in RAM (Screen Size + 50% Scroll Margins)
 Cell **ram_buffer = NULL;
 int buf_start_r = -1, buf_end_r = -1;
 int buf_start_c = -1, buf_end_c = -1;
 int buf_rows = 0, buf_cols = 0;
 
-char swap_filepath[512];
-char original_csv_path[512];
+char swap_filepath[256];
+char original_csv_path[256];
 
 // Helper: Decode VByte integer from memory buffer
 unsigned int decode_vbyte_from_buf(const unsigned char *buf, int *offset) {
@@ -46,30 +61,35 @@ unsigned int decode_vbyte_from_buf(const unsigned char *buf, int *offset) {
     }
 }
 
-// Create .swap file on startup from original miniCsv
+// Executes 'cp -f src dst' using fork() + execvp()
+int copy_file_fork(const char *src_path, const char *dst_path) {
+    pid_t pid = fork();
+
+    if (pid < 0) {
+        return 0; // Fork failed
+    } 
+    else if (pid == 0) {
+        // Child process: execute cp
+        char *args[] = {"cp", "-f", (char *)src_path, (char *)dst_path, NULL};
+        execvp("cp", args);
+        _exit(127); // Exec failed
+    } 
+    else {
+        // Parent process: wait for child
+        int status;
+        if (waitpid(pid, &status, 0) == -1) return 0;
+        return (WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    }
+}
+
+// Create .swap file on startup using fork() + execvp() and restore state
 int init_swap_file(const char *csv_path) {
     snprintf(original_csv_path, sizeof(original_csv_path), "%s", csv_path);
     snprintf(swap_filepath, sizeof(swap_filepath), "%s.swap", csv_path);
 
-    FILE *src = fopen(csv_path, "rb");
-    if (!src) return 0;
+    if (!copy_file_fork(csv_path, swap_filepath)) return 0;
 
-    FILE *dst = fopen(swap_filepath, "wb");
-    if (!dst) {
-        fclose(src);
-        return 0;
-    }
-
-    char buffer[8192];
-    size_t bytes;
-    while ((bytes = fread(buffer, 1, sizeof(buffer), src)) > 0) {
-        fwrite(buffer, 1, bytes, dst);
-    }
-
-    fclose(src);
-    fclose(dst);
-
-    // Read header & row/col index maps from swap file into RAM
+    // Read header, row/col maps, and visibility bitmasks from swap file
     FILE *swap_fp = fopen(swap_filepath, "rb");
     if (!swap_fp) return 0;
 
@@ -81,26 +101,60 @@ int init_swap_file(const char *csv_path) {
     row_map = malloc(matrix.row * sizeof(int));
     col_map = malloc(matrix.col * sizeof(int));
 
+    // Calculate exact byte count required for 1-bit flags (rounded up)
+    hidden_rows_bytes = (matrix.row + 7) / 8;
+    hidden_cols_bytes = (matrix.col + 7) / 8;
+
+    hidden_rows = malloc(hidden_rows_bytes);
+    if (hidden_rows) memset(hidden_rows, 0, hidden_rows_bytes);
+
+    hidden_cols = malloc(hidden_cols_bytes);
+    if (hidden_cols) memset(hidden_cols, 0, hidden_cols_bytes);
+
+    // Read row index mapping
     fseek(swap_fp, matrix.start_arr_row, SEEK_SET);
     fread(row_map, sizeof(int), matrix.row, swap_fp);
 
+    // Read column index mapping
     fseek(swap_fp, matrix.start_arr_col, SEEK_SET);
     fread(col_map, sizeof(int), matrix.col, swap_fp);
+
+    // Read hidden row bitmask (placed immediately after col_map)
+    long hidden_row_offset = matrix.start_arr_col + (matrix.col * sizeof(int));
+    fseek(swap_fp, hidden_row_offset, SEEK_SET);
+    fread(hidden_rows, sizeof(unsigned char), hidden_rows_bytes, swap_fp);
+
+    // Read hidden col bitmask (placed immediately after hidden_rows bitmask)
+    long hidden_col_offset = hidden_row_offset + hidden_rows_bytes;
+    fseek(swap_fp, hidden_col_offset, SEEK_SET);
+    fread(hidden_cols, sizeof(unsigned char), hidden_cols_bytes, swap_fp);
 
     fclose(swap_fp);
     return 1;
 }
 
-// Write row_map and col_map updates to .swap file
+// Write row_map, col_map, and hidden bitmasks back to .swap file
 int update_swap_file_maps() {
     FILE *fp = fopen(swap_filepath, "r+b");
     if (!fp) return 0;
 
+    // Flush row map
     fseek(fp, matrix.start_arr_row, SEEK_SET);
     fwrite(row_map, sizeof(int), matrix.row, fp);
 
+    // Flush col map
     fseek(fp, matrix.start_arr_col, SEEK_SET);
     fwrite(col_map, sizeof(int), matrix.col, fp);
+
+    // Flush hidden rows bitmask
+    long hidden_row_offset = matrix.start_arr_col + (matrix.col * sizeof(int));
+    fseek(fp, hidden_row_offset, SEEK_SET);
+    fwrite(hidden_rows, sizeof(unsigned char), hidden_rows_bytes, fp);
+
+    // Flush hidden cols bitmask
+    long hidden_col_offset = hidden_row_offset + hidden_rows_bytes;
+    fseek(fp, hidden_col_offset, SEEK_SET);
+    fwrite(hidden_cols, sizeof(unsigned char), hidden_cols_bytes, fp);
 
     fclose(fp);
     return 1;
@@ -108,26 +162,8 @@ int update_swap_file_maps() {
 
 // Save .swap file changes back to original miniCsv file (:w / :wq)
 int flush_swap_to_original() {
-    update_swap_file_maps(); // Ensure maps are flushed to .swap first
-
-    FILE *src = fopen(swap_filepath, "rb");
-    if (!src) return 0;
-
-    FILE *dst = fopen(original_csv_path, "wb");
-    if (!dst) {
-        fclose(src);
-        return 0;
-    }
-
-    char buffer[8192];
-    size_t bytes;
-    while ((bytes = fread(buffer, 1, sizeof(buffer), src)) > 0) {
-        fwrite(buffer, 1, bytes, dst);
-    }
-
-    fclose(src);
-    fclose(dst);
-    return 1;
+    update_swap_file_maps(); // Ensure maps and visibility bitmasks are written to disk
+    return copy_file_fork(swap_filepath, original_csv_path);
 }
 
 // Free RAM buffer allocation
@@ -148,7 +184,7 @@ void free_ram_buffer() {
     buf_rows = buf_cols = 0;
 }
 
-// Fetch on-demand viewport chunk (screen size + 50% padding)
+// Fetch on-demand viewport chunk (screen size + 50% scroll padding)
 void load_viewport_chunk_to_ram(int vis_top_r, int vis_bot_r, int vis_top_c, int vis_bot_c) {
     int vis_r_count = vis_bot_r - vis_top_r + 1;
     int vis_c_count = vis_bot_c - vis_top_c + 1;
@@ -251,44 +287,57 @@ void load_viewport_chunk_to_ram(int vis_top_r, int vis_bot_r, int vis_top_c, int
     fclose(fp);
 }
 
-// Reconstruct string for cell from RAM buffer + dictionary file on disk
-void build_cell_text(FILE *dict_fp, int target_r, int target_c, char *out_buf, int buf_size) {
-    out_buf[0] = '\0';
-    if (target_r < buf_start_r || target_r > buf_end_r || target_c < buf_start_c || target_c > buf_end_c) return;
+// Dynamically computes and builds the cell text directly from sorted_words_file
+char *build_cell_text_dynamic(FILE *dict_fp, int target_r, int target_c) {
+    if (target_r < buf_start_r || target_r > buf_end_r || 
+        target_c < buf_start_c || target_c > buf_end_c) {
+        return NULL;
+    }
 
     int r_idx = target_r - buf_start_r;
     int c_idx = target_c - buf_start_c;
 
     Cell *cell = &ram_buffer[r_idx][c_idx];
-    if (cell->count == 0 || !cell->word_ids) return;
+    if (cell->count == 0 || !cell->word_ids) return NULL;
 
-    int current_len = 0;
+    // Step 1: Calculate exact string size from sorted_words_file
+    size_t total_str_len = 0;
     for (int k = 0; k < cell->count; k++) {
-        unsigned int val = cell->word_ids[k];
-        fseek(dict_fp, val, SEEK_SET);
+        unsigned int offset = cell->word_ids[k];
+        fseek(dict_fp, offset, SEEK_SET);
 
-        unsigned char word_len;
+        unsigned char word_len = 0;
         if (fread(&word_len, sizeof(unsigned char), 1, dict_fp) == 1) {
-            char *word_str = malloc(word_len + 1);
-            if (word_str) {
-                if (fread(word_str, sizeof(char), word_len, dict_fp) == word_len) {
-                    word_str[word_len] = '\0';
+            total_str_len += word_len;
+        }
+    }
 
-                    if (current_len > 0 && current_len < buf_size - 1) {
-                        out_buf[current_len++] = ' ';
-                        out_buf[current_len] = '\0';
-                    }
+    // Account for spaces between words + null terminator
+    total_str_len += (cell->count - 1) + 1;
 
-                    int w_idx = 0;
-                    while (word_str[w_idx] != '\0' && current_len < buf_size - 1) {
-                        out_buf[current_len++] = word_str[w_idx++];
-                    }
-                    out_buf[current_len] = '\0';
-                }
-                free(word_str);
+    // Step 2: Dynamically allocate exact string memory
+    char *out_buf = malloc(total_str_len);
+    if (!out_buf) return NULL;
+
+    // Step 3: Populate buffer with word bytes
+    size_t curr_pos = 0;
+    for (int k = 0; k < cell->count; k++) {
+        unsigned int offset = cell->word_ids[k];
+        fseek(dict_fp, offset, SEEK_SET);
+
+        unsigned char word_len = 0;
+        if (fread(&word_len, sizeof(unsigned char), 1, dict_fp) == 1) {
+            if (k > 0) {
+                out_buf[curr_pos++] = ' ';
+            }
+            if (fread(&out_buf[curr_pos], sizeof(char), word_len, dict_fp) == word_len) {
+                curr_pos += word_len;
             }
         }
     }
+    out_buf[curr_pos] = '\0';
+
+    return out_buf;
 }
 
 void draw_grid(FILE *dict_fp, int cur_r, int cur_c, int top_row, int top_col, int base_cell_width, const char *status_msg) {
@@ -297,7 +346,7 @@ void draw_grid(FILE *dict_fp, int cur_r, int cur_c, int top_row, int top_col, in
 
     clear();
 
-    // Top Status Header
+    // Top Status Header Bar
     attron(A_REVERSE);
     mvprintw(0, 0, " [R:%d C:%d] | Map(R:%d C:%d) | Total: %ux%u | RAM Buf: [%d-%d, %d-%d] | ':' Vim | 'q': Quit ", 
             cur_r, cur_c, row_map[cur_r], col_map[cur_c], matrix.row, matrix.col,
@@ -306,12 +355,11 @@ void draw_grid(FILE *dict_fp, int cur_r, int cur_c, int top_row, int top_col, in
     attroff(A_REVERSE);
 
     // Full cell hover preview
-    char hover_buf[MAX_CELL_STR_LEN];
-    build_cell_text(dict_fp, cur_r, cur_c, hover_buf, sizeof(hover_buf));
+    char *hover_buf = build_cell_text_dynamic(dict_fp, cur_r, cur_c);
 
     mvprintw(1, 0, " FULL VALUE: ");
     attron(A_BOLD);
-    printw("%s", hover_buf[0] ? hover_buf : "<EMPTY>");
+    printw("%s", hover_buf ? hover_buf : "<EMPTY>");
     attroff(A_BOLD);
 
     mvhline(2, 0, ACS_HLINE, max_x);
@@ -327,78 +375,95 @@ void draw_grid(FILE *dict_fp, int cur_r, int cur_c, int top_row, int top_col, in
     if (row_digits < 3) row_digits = 3;
 
     int margin_width = row_digits + 2;
-    int max_vis_cols = (max_x - margin_width) / (base_cell_width + 1);
 
     if (max_vis_rows <= 0) max_vis_rows = 1;
-    if (max_vis_cols <= 0) max_vis_cols = 1;
 
-    // Ensure active screen chunk + padding is loaded into RAM
-    int vis_bot_r = (top_row + max_vis_rows - 1 < (int)matrix.row) ? top_row + max_vis_rows - 1 : (int)matrix.row - 1;
-    int vis_bot_c = (top_col + max_vis_cols - 1 < (int)matrix.col) ? top_col + max_vis_cols - 1 : (int)matrix.col - 1;
-    load_viewport_chunk_to_ram(top_row, vis_bot_r, top_col, vis_bot_c);
+    // Fetch required viewport + margin into RAM
+    load_viewport_chunk_to_ram(top_row, (top_row + max_vis_rows < (int)matrix.row) ? top_row + max_vis_rows : matrix.row - 1, 
+                               top_col, (top_col + 50 < (int)matrix.col) ? top_col + 50 : matrix.col - 1);
 
-    // Print headers with Hover Expansion
+    // Print headers with Hover Expansion (Skipping Hidden Columns via Bitmask)
     mvprintw(start_y, 0, "%*s", margin_width, "");
-    for (int c = 0; c < max_vis_cols && (top_col + c) < (int)matrix.col; c++) {
-        int actual_c = top_col + c;
-        int active_w = base_cell_width;
+    int printed_cols = 0;
+    int curr_x = margin_width;
 
-        if (actual_c == cur_c) {
+    for (int c = top_col; c < (int)matrix.col && curr_x < max_x; c++) {
+        if (IS_COL_HIDDEN(c)) continue; // SKIP HIDDEN COLUMN
+
+        int active_w = base_cell_width;
+        if (c == cur_c && hover_buf) {
             int hover_len = strlen(hover_buf);
             if (hover_len > active_w) active_w = hover_len;
         }
 
-        printw("| %-*d ", active_w - 2 > 0 ? active_w - 2 : 1, actual_c);
+        if (curr_x + active_w + 1 > max_x) break;
+
+        printw("| %-*d ", active_w - 2 > 0 ? active_w - 2 : 1, c);
+        curr_x += active_w + 1;
+        printed_cols++;
     }
     mvhline(start_y + 1, 0, ACS_HLINE, max_x);
 
-    // Print grid cells with Hover Expansion
-    char cell_str[MAX_CELL_STR_LEN];
-    for (int r = 0; r < max_vis_rows && (top_row + r) < (int)matrix.row; r++) {
-        int actual_r = top_row + r;
-        int screen_y = start_y + 2 + r;
-        
-        mvprintw(screen_y, 0, "%*d |", row_digits, actual_r);
+    // Print grid cells (Skipping Hidden Rows and Columns via Bitmask)
+    int printed_rows = 0;
+    for (int r = top_row; r < (int)matrix.row && printed_rows < max_vis_rows; r++) {
+        if (IS_ROW_HIDDEN(r)) continue; // SKIP HIDDEN ROW
 
-        for (int c = 0; c < max_vis_cols && (top_col + c) < (int)matrix.col; c++) {
-            int actual_c = top_col + c;
-            build_cell_text(dict_fp, actual_r, actual_c, cell_str, sizeof(cell_str));
+        int screen_y = start_y + 2 + printed_rows;
+        mvprintw(screen_y, 0, "%*d |", row_digits, r);
 
-            int text_len = strlen(cell_str);
+        curr_x = margin_width;
+        for (int c = top_col; c < (int)matrix.col && curr_x < max_x; c++) {
+            if (IS_COL_HIDDEN(c)) continue; // SKIP HIDDEN COLUMN
+
+            char *cell_str = build_cell_text_dynamic(dict_fp, r, c);
+            int text_len = cell_str ? strlen(cell_str) : 0;
             int effective_width = base_cell_width;
 
-            // Expand cell width dynamically on hover
-            if (actual_r == cur_r && actual_c == cur_c) {
+            if (r == cur_r && c == cur_c) {
                 if (text_len > effective_width) effective_width = text_len;
             }
 
-            char display_fmt[MAX_CELL_STR_LEN];
-            if (text_len > effective_width) {
-                if (effective_width > 3) {
-                    strncpy(display_fmt, cell_str, effective_width - 3);
-                    display_fmt[effective_width - 3] = '\0';
-                    strcat(display_fmt, "...");
-                } else {
-                    strncpy(display_fmt, cell_str, effective_width);
-                    display_fmt[effective_width] = '\0';
-                }
-            } else {
-                memset(display_fmt, ' ', effective_width);
-                memcpy(display_fmt, cell_str, text_len);
-                display_fmt[effective_width] = '\0';
+            if (curr_x + effective_width + 1 > max_x) {
+                if (cell_str) free(cell_str);
+                break;
             }
 
-            if (actual_r == cur_r && actual_c == cur_c) {
-                attron(A_STANDOUT | A_BOLD);
-                printw("%s", display_fmt);
-                attroff(A_STANDOUT | A_BOLD);
-            } else {
-                printw("%s", display_fmt);
+            char *display_fmt = malloc(effective_width + 1);
+            if (display_fmt) {
+                if (text_len > effective_width) {
+                    if (effective_width > 3) {
+                        strncpy(display_fmt, cell_str, effective_width - 3);
+                        display_fmt[effective_width - 3] = '\0';
+                        strcat(display_fmt, "...");
+                    } else {
+                        strncpy(display_fmt, cell_str, effective_width);
+                        display_fmt[effective_width] = '\0';
+                    }
+                } else {
+                    memset(display_fmt, ' ', effective_width);
+                    if (cell_str) memcpy(display_fmt, cell_str, text_len);
+                    display_fmt[effective_width] = '\0';
+                }
+
+                if (r == cur_r && c == cur_c) {
+                    attron(A_STANDOUT | A_BOLD);
+                    printw("%s", display_fmt);
+                    attroff(A_STANDOUT | A_BOLD);
+                } else {
+                    printw("%s", display_fmt);
+                }
+                free(display_fmt);
             }
 
             printw("|");
+            if (cell_str) free(cell_str);
+            curr_x += effective_width + 1;
         }
+        printed_rows++;
     }
+
+    if (hover_buf) free(hover_buf);
 
     if (status_msg && status_msg[0] != '\0') {
         mvprintw(max_y - 1, 0, "%s", status_msg);
@@ -420,7 +485,7 @@ int handle_vim_command(const char *cmd_buf, int *cur_r, int *cur_c, int *cell_wi
     // Write changes from .swap to miniCsv (:w)
     if (strcmp(cmd_buf, "w") == 0 || strcmp(cmd_buf, "write") == 0) {
         if (flush_swap_to_original()) {
-            snprintf(status_msg, 256, "Saved changes from .swap to original file.");
+            snprintf(status_msg, 256, "Saved changes and visibility settings to original file.");
         } else {
             snprintf(status_msg, 256, "Error saving to original file.");
         }
@@ -433,6 +498,103 @@ int handle_vim_command(const char *cmd_buf, int *cur_r, int *cur_c, int *cell_wi
         return 0;
     }
 
+    // Unhide All (:unhide or :showAll)
+    if (strcmp(cmd_buf, "unhide") == 0 || strcmp(cmd_buf, "showAll") == 0) {
+        memset(hidden_rows, 0, hidden_rows_bytes);
+        memset(hidden_cols, 0, hidden_cols_bytes);
+        update_swap_file_maps();
+        snprintf(status_msg, 256, "Unhid all rows and columns.");
+        return 1;
+    }
+
+    // Selective Unhide Row(s) (:unhideRow(5), :unhideRow(5:10), or :unhideRow 5 10)
+    int u_r_start = -1, u_r_end = -1;
+    if (sscanf(cmd_buf, "unhideRow(%d:%d)", &u_r_start, &u_r_end) == 2 || sscanf(cmd_buf, "unhideRow %d %d", &u_r_start, &u_r_end) == 2) {
+        if (u_r_start >= 0 && u_r_start < (int)matrix.row && u_r_end >= u_r_start && u_r_end < (int)matrix.row) {
+            for (int r = u_r_start; r <= u_r_end; r++) UNHIDE_ROW(r);
+            update_swap_file_maps();
+            snprintf(status_msg, 256, "Unhid rows %d to %d (Bitmask saved to .swap)", u_r_start, u_r_end);
+        } else {
+            snprintf(status_msg, 256, "Error: Invalid row range (%d:%d)", u_r_start, u_r_end);
+        }
+        return 1;
+    } else if (sscanf(cmd_buf, "unhideRow(%d)", &u_r_start) == 1 || sscanf(cmd_buf, "unhideRow %d", &u_r_start) == 1) {
+        if (u_r_start >= 0 && u_r_start < (int)matrix.row) {
+            UNHIDE_ROW(u_r_start);
+            update_swap_file_maps();
+            snprintf(status_msg, 256, "Unhid row %d (Bitmask saved to .swap)", u_r_start);
+        } else {
+            snprintf(status_msg, 256, "Error: Row %d out of bounds", u_r_start);
+        }
+        return 1;
+    }
+
+    // Selective Unhide Col(s) (:unhideCol(2), :unhideCol(2:8), or :unhideCol 2 8)
+    int u_c_start = -1, u_c_end = -1;
+    if (sscanf(cmd_buf, "unhideCol(%d:%d)", &u_c_start, &u_c_end) == 2 || sscanf(cmd_buf, "unhideCol %d %d", &u_c_start, &u_c_end) == 2) {
+        if (u_c_start >= 0 && u_c_start < (int)matrix.col && u_c_end >= u_c_start && u_c_end < (int)matrix.col) {
+            for (int c = u_c_start; c <= u_c_end; c++) UNHIDE_COL(c);
+            update_swap_file_maps();
+            snprintf(status_msg, 256, "Unhid columns %d to %d (Bitmask saved to .swap)", u_c_start, u_c_end);
+        } else {
+            snprintf(status_msg, 256, "Error: Invalid column range (%d:%d)", u_c_start, u_c_end);
+        }
+        return 1;
+    } else if (sscanf(cmd_buf, "unhideCol(%d)", &u_c_start) == 1 || sscanf(cmd_buf, "unhideCol %d", &u_c_start) == 1) {
+        if (u_c_start >= 0 && u_c_start < (int)matrix.col) {
+            UNHIDE_COL(u_c_start);
+            update_swap_file_maps();
+            snprintf(status_msg, 256, "Unhid column %d (Bitmask saved to .swap)", u_c_start);
+        } else {
+            snprintf(status_msg, 256, "Error: Column %d out of bounds", u_c_start);
+        }
+        return 1;
+    }
+
+    // Hide Row(s) (:hideRow(5), :hideRow(5:10), or :hideRow 5 10)
+    int r_start = -1, r_end = -1;
+    if (sscanf(cmd_buf, "hideRow(%d:%d)", &r_start, &r_end) == 2 || sscanf(cmd_buf, "hideRow %d %d", &r_start, &r_end) == 2) {
+        if (r_start >= 0 && r_start < (int)matrix.row && r_end >= r_start && r_end < (int)matrix.row) {
+            for (int r = r_start; r <= r_end; r++) HIDE_ROW(r);
+            update_swap_file_maps();
+            snprintf(status_msg, 256, "Hidden rows %d to %d (Bitmask saved to .swap)", r_start, r_end);
+        } else {
+            snprintf(status_msg, 256, "Error: Invalid row range (%d:%d)", r_start, r_end);
+        }
+        return 1;
+    } else if (sscanf(cmd_buf, "hideRow(%d)", &r_start) == 1 || sscanf(cmd_buf, "hideRow %d", &r_start) == 1) {
+        if (r_start >= 0 && r_start < (int)matrix.row) {
+            HIDE_ROW(r_start);
+            update_swap_file_maps();
+            snprintf(status_msg, 256, "Hidden row %d (Bitmask saved to .swap)", r_start);
+        } else {
+            snprintf(status_msg, 256, "Error: Row %d out of bounds", r_start);
+        }
+        return 1;
+    }
+
+    // Hide Col(s) (:hideCol(2), :hideCol(2:8), or :hideCol 2 8)
+    int c_start = -1, c_end = -1;
+    if (sscanf(cmd_buf, "hideCol(%d:%d)", &c_start, &c_end) == 2 || sscanf(cmd_buf, "hideCol %d %d", &c_start, &c_end) == 2) {
+        if (c_start >= 0 && c_start < (int)matrix.col && c_end >= c_start && c_end < (int)matrix.col) {
+            for (int c = c_start; c <= c_end; c++) HIDE_COL(c);
+            update_swap_file_maps();
+            snprintf(status_msg, 256, "Hidden columns %d to %d (Bitmask saved to .swap)", c_start, c_end);
+        } else {
+            snprintf(status_msg, 256, "Error: Invalid column range (%d:%d)", c_start, c_end);
+        }
+        return 1;
+    } else if (sscanf(cmd_buf, "hideCol(%d)", &c_start) == 1 || sscanf(cmd_buf, "hideCol %d", &c_start) == 1) {
+        if (c_start >= 0 && c_start < (int)matrix.col) {
+            HIDE_COL(c_start);
+            update_swap_file_maps();
+            snprintf(status_msg, 256, "Hidden column %d (Bitmask saved to .swap)", c_start);
+        } else {
+            snprintf(status_msg, 256, "Error: Column %d out of bounds", c_start);
+        }
+        return 1;
+    }
+
     // Swap Rows (:swapRow(2, 5) or :swapRow 2 5)
     int r1 = -1, r2 = -1;
     if (sscanf(cmd_buf, "swapRow(%d, %d)", &r1, &r2) == 2 || sscanf(cmd_buf, "swapRow %d %d", &r1, &r2) == 2) {
@@ -440,8 +602,8 @@ int handle_vim_command(const char *cmd_buf, int *cur_r, int *cur_c, int *cell_wi
             int temp = row_map[r1];
             row_map[r1] = row_map[r2];
             row_map[r2] = temp;
-            update_swap_file_maps(); // Write immediately to .swap file
-            free_ram_buffer();       // Invalidate RAM cache to reload with new map
+            update_swap_file_maps();
+            free_ram_buffer();
             snprintf(status_msg, 256, "Swapped row %d & %d (Saved to .swap file)", r1, r2);
         } else {
             snprintf(status_msg, 256, "Error: Invalid row indices (%d, %d)", r1, r2);
@@ -456,8 +618,8 @@ int handle_vim_command(const char *cmd_buf, int *cur_r, int *cur_c, int *cell_wi
             int temp = col_map[c1];
             col_map[c1] = col_map[c2];
             col_map[c2] = temp;
-            update_swap_file_maps(); // Write immediately to .swap file
-            free_ram_buffer();       // Invalidate RAM cache to reload with new map
+            update_swap_file_maps();
+            free_ram_buffer();
             snprintf(status_msg, 256, "Swapped col %d & %d (Saved to .swap file)", c1, c2);
         } else {
             snprintf(status_msg, 256, "Error: Invalid column indices (%d, %d)", c1, c2);
@@ -506,6 +668,8 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Error opening dictionary file %s\n", dict_path);
         if (row_map) free(row_map);
         if (col_map) free(col_map);
+        if (hidden_rows) free(hidden_rows);
+        if (hidden_cols) free(hidden_cols);
         remove(swap_filepath);
         return 1;
     }
@@ -538,6 +702,13 @@ int main(int argc, char **argv) {
 
         if (max_vis_rows <= 0) max_vis_rows = 1;
         if (max_vis_cols <= 0) max_vis_cols = 1;
+
+        // Skip hidden rows when adjusting cursor viewport bounds
+        while (cur_r < (int)matrix.row && IS_ROW_HIDDEN(cur_r)) cur_r++;
+        if (cur_r >= (int)matrix.row) cur_r = 0;
+
+        while (cur_c < (int)matrix.col && IS_COL_HIDDEN(cur_c)) cur_c++;
+        if (cur_c >= (int)matrix.col) cur_c = 0;
 
         if (cur_r < top_row) top_row = cur_r;
         if (cur_r >= top_row + max_vis_rows) top_row = cur_r - max_vis_rows + 1;
@@ -595,16 +766,28 @@ int main(int argc, char **argv) {
 
         switch (ch) {
             case KEY_UP: case 'k': case 'K':
-                if (cur_r > 0) cur_r--;
+                do {
+                    if (cur_r > 0) cur_r--;
+                    else break;
+                } while (IS_ROW_HIDDEN(cur_r));
                 break;
             case KEY_DOWN: case 'j': case 'J':
-                if (cur_r < (int)matrix.row - 1) cur_r++;
+                do {
+                    if (cur_r < (int)matrix.row - 1) cur_r++;
+                    else break;
+                } while (IS_ROW_HIDDEN(cur_r));
                 break;
             case KEY_LEFT: case 'h': case 'H':
-                if (cur_c > 0) cur_c--;
+                do {
+                    if (cur_c > 0) cur_c--;
+                    else break;
+                } while (IS_COL_HIDDEN(cur_c));
                 break;
             case KEY_RIGHT: case 'l': case 'L':
-                if (cur_c < (int)matrix.col - 1) cur_c++;
+                do {
+                    if (cur_c < (int)matrix.col - 1) cur_c++;
+                    else break;
+                } while (IS_COL_HIDDEN(cur_c));
                 break;
         }
     }
@@ -612,12 +795,14 @@ int main(int argc, char **argv) {
     endwin();
     fclose(dict_fp);
 
-    // Cleanup resources
+    // Free resources
     free_ram_buffer();
     if (row_map) free(row_map);
     if (col_map) free(col_map);
+    if (hidden_rows) free(hidden_rows);
+    if (hidden_cols) free(hidden_cols);
 
-    // Delete temporary .swap file upon exit
+    // Remove temporary .swap file upon exit
     remove(swap_filepath);
 
     return 0;
